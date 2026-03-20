@@ -132,9 +132,8 @@ def solve_projection_coefficients(
 
 
 @partial(jax.jit, static_argnames=("rank",))
-def projected_values_batch(
+def beta_from_projection_samples(
     U: Array,
-    X_eval: Array,
     X_mc: Array,
     f_vals: Array,
     rank: int,
@@ -143,8 +142,31 @@ def projected_values_batch(
     P = build_projector(U, rank)
     Phi_proj = feature_map_batch_from_projector(X_mc, U, P)
     beta_hat, _, _ = solve_projection_coefficients(Phi_proj, f_vals, ridge)
-    Phi_eval = feature_map_batch_from_projector(X_eval, U, P)
-    return Phi_eval @ beta_hat
+    return beta_hat
+
+
+@partial(jax.jit, static_argnames=("rank",))
+def projected_values_with_fixed_beta(
+    U: Array,
+    X_eval: Array,
+    beta: Array,
+    rank: int,
+) -> Array:
+    Phi_eval = feature_map_batch(X_eval, U, rank)
+    return Phi_eval @ beta
+
+
+@partial(jax.jit, static_argnames=("rank",))
+def projected_values_batch(
+    U: Array,
+    X_eval: Array,
+    X_mc: Array,
+    f_vals: Array,
+    rank: int,
+    ridge: float = 1e-6,
+) -> Array:
+    beta_hat = beta_from_projection_samples(U, X_mc, f_vals, rank, ridge)
+    return projected_values_with_fixed_beta(U, X_eval, beta_hat, rank)
 
 
 @partial(jax.jit, static_argnames=("rank",))
@@ -156,12 +178,21 @@ def local_sensitivity_batch(
     rank: int,
     ridge: float = 1e-6,
 ) -> Array:
-    jacobian = jax.jacrev(projected_values_batch, argnums=0)(
-        U_star, X_eval, X_proj, f_vals, rank, ridge
+    beta_star = beta_from_projection_samples(U_star, X_proj, f_vals, rank, ridge)
+    phi_eval = feature_map_batch(X_eval, U_star, rank)
+
+    jac_phi_beta = jax.jacrev(projected_values_with_fixed_beta, argnums=0)(
+        U_star, X_eval, beta_star, rank
     )
-    return -jnp.moveaxis(jacobian.reshape(U_star.shape + (X_eval.shape[0],)), -1, 0).reshape(
-        X_eval.shape[0], -1
+    term_phi = jac_phi_beta.reshape(X_eval.shape[0], -1)
+
+    jac_beta = jax.jacrev(beta_from_projection_samples, argnums=0)(
+        U_star, X_proj, f_vals, rank, ridge
     )
+    jac_beta_flat = jac_beta.reshape(beta_star.shape[0], -1)
+    term_beta = phi_eval @ jac_beta_flat
+
+    return -(term_phi + term_beta)
 
 
 @jax.jit
@@ -186,6 +217,37 @@ def quadratic_risk_from_sigma(
     return jnp.mean(quadratic_terms)
 
 
+@partial(jax.jit, static_argnames=("rank", "chunk_size"))
+def quadratic_risk_from_sigma_chunked(
+    U_star: Array,
+    sigma_z: Array,
+    X_proj: Array,
+    f_vals: Array,
+    X_eval: Array,
+    rank: int,
+    chunk_size: int,
+    ridge: float = 1e-6,
+) -> Array:
+    n_eval, d = X_eval.shape
+    n_chunks = (n_eval + chunk_size - 1) // chunk_size
+    padded_n = n_chunks * chunk_size
+    pad_rows = padded_n - n_eval
+
+    X_eval_padded = jnp.pad(X_eval, ((0, pad_rows), (0, 0)))
+    valid_mask = jnp.pad(jnp.ones((n_eval,), dtype=X_eval.dtype), (0, pad_rows))
+
+    X_eval_chunks = X_eval_padded.reshape(n_chunks, chunk_size, d)
+    mask_chunks = valid_mask.reshape(n_chunks, chunk_size)
+
+    def chunk_contribution(X_chunk: Array, mask_chunk: Array) -> tuple[Array, Array]:
+        sensitivities = local_sensitivity_batch(U_star, X_chunk, X_proj, f_vals, rank, ridge)
+        quadratic_terms = jnp.einsum("ni,ij,nj->n", sensitivities, sigma_z, sensitivities)
+        return jnp.sum(quadratic_terms * mask_chunk), jnp.sum(mask_chunk)
+
+    chunk_sums, chunk_counts = jax.vmap(chunk_contribution)(X_eval_chunks, mask_chunks)
+    return jnp.sum(chunk_sums) / jnp.sum(chunk_counts)
+
+
 def estimate_expected_l2_sq(
     U_star: Array,
     theta_star: Array,
@@ -196,6 +258,7 @@ def estimate_expected_l2_sq(
     rank: int | None = None,
     fisher_ridge: float = 1e-6,
     proj_ridge: float = 1e-6,
+    eval_chunk_size: int | None = 256,
 ) -> tuple[Array, dict[str, Array]]:
     U_star = jnp.asarray(U_star, dtype=jnp.float32)
     theta_star = jnp.asarray(theta_star, dtype=jnp.float32)
@@ -210,7 +273,19 @@ def estimate_expected_l2_sq(
     f_vals = predict_batch(X_proj, U_star, theta_star, rank)
 
     X_eval, _ = sample_mixture(key_eval, U_star, n_eval_mc)
-    risk = quadratic_risk_from_sigma(U_star, sigma_z, X_proj, f_vals, X_eval, rank, proj_ridge)
+    if eval_chunk_size is None:
+        risk = quadratic_risk_from_sigma(U_star, sigma_z, X_proj, f_vals, X_eval, rank, proj_ridge)
+    else:
+        risk = quadratic_risk_from_sigma_chunked(
+            U_star,
+            sigma_z,
+            X_proj,
+            f_vals,
+            X_eval,
+            rank,
+            eval_chunk_size,
+            proj_ridge,
+        )
 
     diagnostics = {
         "fisher_hat": fisher_hat,
